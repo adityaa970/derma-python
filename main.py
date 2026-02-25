@@ -56,6 +56,13 @@ RISK_MAPPING = {
 # High confidence threshold to declare High risk
 HIGH_RISK_CONFIDENCE_THRESHOLD = 0.70  # 70% confidence needed for High risk
 
+# Minimum confidence to declare ANY disease — below this = Normal/Healthy skin
+DISEASE_CONFIDENCE_THRESHOLD = 0.60  # Top class must score >= 60% to declare a disease
+
+# Entropy threshold — if predictions are spread (uncertain), treat as Normal
+# Max entropy for 7 classes = log(7) ≈ 1.95; uncertain model scores > 1.2
+NORMAL_ENTROPY_THRESHOLD = 1.20
+
 # --- DEMO MODE FLAG ---
 DEMO_MODE = False  # Set to True when no model is available
 
@@ -152,10 +159,10 @@ async def load_ai_assets():
 
 # --- HELPER FUNCTIONS ---
 
-def is_skin_image(img: Image.Image, threshold: float = 0.12) -> tuple[bool, float]:
+def is_skin_image(img: Image.Image, threshold: float = 0.25) -> tuple[bool, float]:
     """
-    Validates if the image contains skin-like pixels.
-    Permissive detection to work across different skin tones and lighting.
+    Validates if the image contains skin-like pixels with stricter detection.
+    Now requires at least 25% skin-like pixels to pass validation.
     
     Returns:
         tuple: (is_valid, skin_percentage)
@@ -169,35 +176,38 @@ def is_skin_image(img: Image.Image, threshold: float = 0.12) -> tuple[bool, floa
         g = img_array[:,:,1]
         b = img_array[:,:,2]
         
-        # Permissive skin detection - covers wide range of skin tones
-        # Light skin
+        # More restrictive skin detection
+        # Light skin - tighter ranges
         light_skin = (
-            (r > 80) & (g > 40) & (b > 20) &
-            (r >= g) & (r >= b)
+            (r > 120) & (g > 60) & (b > 40) &
+            (r >= g) & (r >= b) &
+            ((r - g) > 10) & ((r - b) > 15)
         )
         
-        # Medium/brown skin
+        # Medium/brown skin - more restrictive
         medium_skin = (
-            (r > 60) & (g > 35) & (b > 15) &
-            (r >= b)
+            (r > 80) & (g > 50) & (b > 30) &
+            (r >= b) & ((r - b) > 10) &
+            ((r + g) > (b * 2))
         )
         
-        # Dark skin (very permissive)
+        # Dark skin - require obvious skin characteristics
         dark_skin = (
-            (r > 40) & (g > 25) & (b > 10) &
-            (r >= b)
+            (r > 60) & (g > 40) & (b > 20) &
+            (r >= b) & ((r - b) > 5) &
+            ((r + g) > (b * 1.8))
         )
         
-        # Pink/reddish (skin conditions)
+        # Pink/reddish (skin conditions) - more restrictive
         pinkish = (
-            (r > 100) & (g > 50) & (b > 50) &
-            (r > g)
+            (r > 130) & (g > 70) & (b > 60) &
+            (r > g) & ((r - g) > 15)
         )
         
-        # Beige/tan tones
+        # Beige/tan tones - higher thresholds
         beige = (
-            (r > 150) & (g > 100) & (b > 70) &
-            (r > b)
+            (r > 160) & (g > 120) & (b > 80) &
+            (r > b) & ((r - b) > 20)
         )
         
         # Combine all
@@ -277,15 +287,24 @@ async def predict(file: UploadFile = File(...)):
     
     # 3. Check if running in demo mode (TensorFlow not available)
     if DEMO_MODE:
-        # Demo mode - prefer safe/benign diagnoses
-        safe_conditions = ["Melanocytic Nevi", "Benign Keratosis", "Dermatofibroma", "Vascular Lesions"]
-        diagnosis = random.choice(safe_conditions)  # Only return safe conditions in demo
+        # Demo mode - 40% chance of Normal, rest are benign conditions
+        demo_options = [
+            ("Normal / Healthy Skin", "Normal"),
+            ("Normal / Healthy Skin", "Normal"),
+            ("Melanocytic Nevi", "Low"),
+            ("Benign Keratosis", "Low"),
+            ("Dermatofibroma", "Low"),
+        ]
+        diagnosis, risk_level = random.choice(demo_options)
         confidence = random.uniform(55.0, 85.0)
-        risk_level = "Low"  # Always Low in demo mode
-        action_plan = "This appears to be a common, benign skin condition. Monitor for any changes. No immediate action needed."
-        
+
+        if risk_level == "Normal":
+            action_plan = "Your skin looks healthy! No signs of a skin condition were detected. Keep up good skin care habits and use sunscreen regularly."
+        else:
+            action_plan = "This appears to be a common, benign skin condition. Monitor for any changes. No immediate action needed."
+
         print(f"📋 [DEMO] Simulated diagnosis: {diagnosis} ({confidence:.1f}%)")
-        
+
         return {
             "diagnosis": diagnosis,
             "confidence": round(confidence, 2),
@@ -315,16 +334,40 @@ async def predict(file: UploadFile = File(...)):
     
     print(f"✅ Predicted class index: {class_index}, confidence: {confidence*100:.1f}%")
     
-    # Confidence threshold - reject if model is too uncertain
-    MIN_CONFIDENCE = 0.30  # 30% minimum (lowered for better UX)
+    # Confidence threshold - if below DISEASE_CONFIDENCE_THRESHOLD, skin is Normal/Healthy
+    MIN_CONFIDENCE = 0.10  # Absolute floor — below this, image is unclear
     if confidence < MIN_CONFIDENCE:
         raise HTTPException(
             status_code=400,
-            detail=f"Could not identify a skin condition in this image (confidence: {confidence*100:.1f}%). Please upload a clear, close-up photo of the affected skin area."
+            detail=f"Could not identify the skin area in this image (confidence: {confidence*100:.1f}%). Please upload a clear, close-up photo of the affected skin area."
         )
-    
+
+    # Entropy check: if prediction distribution is too spread out, model is uncertain → Normal
+    # Shannon entropy: H = -sum(p * log2(p)), max for 7 classes ≈ 2.807
+    probs = predictions[0]
+    probs_safe = np.clip(probs, 1e-9, 1.0)  # prevent log(0)
+    entropy = float(-np.sum(probs_safe * np.log2(probs_safe)))
+    print(f"📊 Prediction entropy: {entropy:.3f} (threshold: {NORMAL_ENTROPY_THRESHOLD})")
+
+    # If model isn't confident about any specific disease → Normal skin
+    is_normal = (confidence < DISEASE_CONFIDENCE_THRESHOLD) or (entropy > NORMAL_ENTROPY_THRESHOLD)
+    if is_normal:
+        print(f"✅ Returning Normal/Healthy Skin (confidence={confidence*100:.1f}%, entropy={entropy:.3f})")
+        return {
+            "diagnosis": "Normal / Healthy Skin",
+            "confidence": round(confidence * 100, 2),
+            "risk_level": "Normal",
+            "action_plan": "Your skin looks healthy! No signs of a skin condition were detected. Keep up good skin care habits and use sunscreen regularly.",
+            "demo_mode": False,
+            "skin_detected": round(skin_percentage * 100, 1),
+            "all_predictions": {
+                CLASS_NAMES[i]: round(float(predictions[0][i]) * 100, 2)
+                for i in range(min(len(CLASS_NAMES), len(predictions[0])))
+            }
+        }
+
     diagnosis = CLASS_NAMES[class_index] if class_index < len(CLASS_NAMES) else "Unknown"
-    
+
     # Determine Risk Level - Conservative approach
     # Only show "High" risk if:
     # 1. The condition is genuinely high-risk (Melanoma)
