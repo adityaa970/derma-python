@@ -1,7 +1,6 @@
 fastapi
 uvicorn[standard]
-# Use CPU build compatible with many hosts (Render) and Python 3.10
-tensorflow-cpu==2.11.0
+tensorflow-cpu
 numpy
 Pillow
 python-multipart
