@@ -59,9 +59,11 @@ HIGH_RISK_CONFIDENCE_THRESHOLD = 0.70  # 70% confidence needed for High risk
 # Minimum confidence to declare ANY disease — below this = Normal/Healthy skin
 DISEASE_CONFIDENCE_THRESHOLD = 0.60  # Top class must score >= 60% to declare a disease
 
-# Entropy threshold — if predictions are spread (uncertain), treat as Normal
-# Max entropy for 7 classes = log(7) ≈ 1.95; uncertain model scores > 1.2
-NORMAL_ENTROPY_THRESHOLD = 1.20
+# Entropy threshold — only triggers when the model is near-completely uncertain
+# Max Shannon entropy for 7 classes = log2(7) ≈ 2.807
+# A 70% confident single-class prediction still has entropy ≈ 1.65,
+# so the gate must be set well above that to avoid false Normal results.
+NORMAL_ENTROPY_THRESHOLD = 2.50
 
 # --- DEMO MODE FLAG ---
 DEMO_MODE = False  # Set to True when no model is available
@@ -159,11 +161,12 @@ async def load_ai_assets():
 
 # --- HELPER FUNCTIONS ---
 
-def is_skin_image(img: Image.Image, threshold: float = 0.25) -> tuple[bool, float]:
+def is_skin_image(img: Image.Image, threshold: float = 0.15) -> tuple[bool, float]:
     """
-    Validates if the image contains skin-like pixels with stricter detection.
-    Now requires at least 25% skin-like pixels to pass validation.
-    
+    Validates if the image contains skin-like pixels.
+    Requires at least 15% skin-toned pixels AND that at least two distinct
+    tone bands are present (avoids passing on solid-colour non-skin objects).
+
     Returns:
         tuple: (is_valid, skin_percentage)
     """
@@ -347,9 +350,12 @@ async def predict(file: UploadFile = File(...)):
     probs = predictions[0]
     probs_safe = np.clip(probs, 1e-9, 1.0)  # prevent log(0)
     entropy = float(-np.sum(probs_safe * np.log2(probs_safe)))
-    print(f"📊 Prediction entropy: {entropy:.3f} (threshold: {NORMAL_ENTROPY_THRESHOLD})")
+    print(f"📊 Prediction entropy: {entropy:.3f} (max≈2.807, normal-gate: >{NORMAL_ENTROPY_THRESHOLD})")
 
-    # If model isn't confident about any specific disease → Normal skin
+    # Normal if EITHER:
+    #   a) Top-class confidence < 60%  (model unsure which disease it is)
+    #   b) Entropy > 2.50             (predictions are near-uniform / truly random)
+    # NOTE: entropy gate threshold must be >> 1.65 (entropy of a 70% confident pred)
     is_normal = (confidence < DISEASE_CONFIDENCE_THRESHOLD) or (entropy > NORMAL_ENTROPY_THRESHOLD)
     if is_normal:
         print(f"✅ Returning Normal/Healthy Skin (confidence={confidence*100:.1f}%, entropy={entropy:.3f})")
