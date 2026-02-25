@@ -1,13 +1,23 @@
 import uvicorn
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import tensorflow as tf
-from tensorflow.keras.models import load_model
-from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
-from tensorflow.keras.preprocessing import image
 import numpy as np
 import io
 from PIL import Image
+
+# Try to import TensorFlow, fall back to demo mode if it fails
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import load_model
+    from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+    from tensorflow.keras.preprocessing import image
+    TF_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️ TensorFlow not available: {e}")
+    print("🔄 Will run in DEMO MODE only")
+    TF_AVAILABLE = False
+    # Create dummy objects to prevent errors
+    tf = None
 
 # Initialize the App
 app = FastAPI(
@@ -49,6 +59,22 @@ DEMO_MODE = False  # Set to True when no model is available
 @app.on_event("startup")
 async def load_ai_assets():
     global model, CLASS_NAMES, DEMO_MODE
+    
+    if not TF_AVAILABLE:
+        print("🔄 TensorFlow not available - running in DEMO MODE")
+        DEMO_MODE = True
+        # Set default class names for demo mode
+        CLASS_NAMES = [
+            "Actinic Keratosis",
+            "Basal Cell Carcinoma", 
+            "Benign Keratosis",
+            "Dermatofibroma",
+            "Melanocytic Nevi",
+            "Melanoma",
+            "Vascular Lesions"
+        ]
+        return
+        
     try:
         # Load the trained .h5 model
         model = load_model("dermasetu_model.h5")
@@ -87,13 +113,17 @@ def preprocess_image(img_bytes):
         img = img.resize((224, 224))
         
         # Convert to Array
-        img_array = image.img_to_array(img)
+        img_array = np.array(img)
         
         # Add Batch Dimension (1, 224, 224, 3)
         img_array = np.expand_dims(img_array, axis=0)
         
-        # Preprocess (Scale pixel values)
-        return preprocess_input(img_array)
+        # Preprocess (Scale pixel values) - only if TensorFlow is available
+        if TF_AVAILABLE:
+            return preprocess_input(img_array)
+        else:
+            # Simple normalization for demo mode
+            return img_array / 255.0
     except Exception as e:
         raise HTTPException(status_code=400, detail="Invalid image file")
 
@@ -101,7 +131,12 @@ def preprocess_image(img_bytes):
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "model_loaded": model is not None, "demo_mode": DEMO_MODE}
+    return {
+        "status": "online", 
+        "model_loaded": model is not None, 
+        "demo_mode": DEMO_MODE,
+        "tensorflow_available": TF_AVAILABLE
+    }
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
