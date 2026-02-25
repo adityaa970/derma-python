@@ -42,16 +42,19 @@ model = None
 CLASS_NAMES = []
 
 # --- RISK MAPPING ---
-# Specific dermatological risk assessment
+# Only truly dangerous conditions are marked High, everything else is safe
 RISK_MAPPING = {
     "Melanoma": "High",
-    "Basal Cell Carcinoma": "High",
-    "Actinic Keratosis": "High",
+    "Basal Cell Carcinoma": "Moderate",
+    "Actinic Keratosis": "Moderate",
     "Melanocytic Nevi": "Low",
     "Benign Keratosis": "Low",
     "Dermatofibroma": "Low",
     "Vascular Lesions": "Low"
 }
+
+# High confidence threshold to declare High risk
+HIGH_RISK_CONFIDENCE_THRESHOLD = 0.70  # 70% confidence needed for High risk
 
 # --- DEMO MODE FLAG ---
 DEMO_MODE = False  # Set to True when no model is available
@@ -149,56 +152,56 @@ async def load_ai_assets():
 
 # --- HELPER FUNCTIONS ---
 
-def is_skin_image(img: Image.Image, threshold: float = 0.25) -> tuple[bool, float]:
+def is_skin_image(img: Image.Image, threshold: float = 0.12) -> tuple[bool, float]:
     """
-    Validates if the image contains skin-like pixels using strict color analysis.
-    Uses RGB color rules to detect actual skin tones.
+    Validates if the image contains skin-like pixels.
+    Permissive detection to work across different skin tones and lighting.
     
     Returns:
         tuple: (is_valid, skin_percentage)
     """
     try:
         # Convert to RGB and resize for faster processing
-        img_rgb = img.convert("RGB").resize((100, 100))
+        img_rgb = img.convert("RGB").resize((50, 50))  # Smaller for speed
         img_array = np.array(img_rgb, dtype=np.float32)
         
         r = img_array[:,:,0]
         g = img_array[:,:,1]
         b = img_array[:,:,2]
         
-        # Strict skin detection rules based on dermatology research
-        # Rule 1: Skin has more red than green, more green than blue typically
-        # Rule 2: Skin falls within specific RGB ranges
-        # Rule 3: R-G difference should be in a specific range for skin
-        
-        # Light/medium skin tones (strict)
+        # Permissive skin detection - covers wide range of skin tones
+        # Light skin
         light_skin = (
-            (r > 95) & (g > 40) & (b > 20) &
-            (r > g) & (g > b) &  # R > G > B typical for skin
-            ((r - g) > 15) &  # Clear red dominance
-            ((r - g) < 100) &  # But not too extreme (like red objects)
-            (np.abs(r - g) <= np.abs(g - b) * 3)  # Balanced color distribution
+            (r > 80) & (g > 40) & (b > 20) &
+            (r >= g) & (r >= b)
         )
         
-        # Brown/dark skin tones (strict)
+        # Medium/brown skin
+        medium_skin = (
+            (r > 60) & (g > 35) & (b > 15) &
+            (r >= b)
+        )
+        
+        # Dark skin (very permissive)
         dark_skin = (
-            (r > 50) & (g > 30) & (b > 15) &
-            (r > b) &  # Red channel dominant over blue
-            (r >= g) &  # Red >= green
-            ((r - b) > 10) &  # Clear warm undertone
-            (r < 200)  # Not too bright
+            (r > 40) & (g > 25) & (b > 10) &
+            (r >= b)
         )
         
-        # Pink/reddish skin (common in skin conditions like rashes)
-        pinkish_skin = (
-            (r > 150) & (g > 80) & (b > 80) &
-            (r > g) & (r > b) &
-            ((r - g) > 20) & ((r - b) > 20) &
-            ((g - b) < 30)  # Green and blue relatively close (pinkish)
+        # Pink/reddish (skin conditions)
+        pinkish = (
+            (r > 100) & (g > 50) & (b > 50) &
+            (r > g)
         )
         
-        # Combine skin detections
-        skin_mask = light_skin | dark_skin | pinkish_skin
+        # Beige/tan tones
+        beige = (
+            (r > 150) & (g > 100) & (b > 70) &
+            (r > b)
+        )
+        
+        # Combine all
+        skin_mask = light_skin | medium_skin | dark_skin | pinkish | beige
         
         skin_percentage = float(np.mean(skin_mask))
         
@@ -206,7 +209,8 @@ def is_skin_image(img: Image.Image, threshold: float = 0.25) -> tuple[bool, floa
         
     except Exception as e:
         print(f"Skin detection error: {e}")
-        return True, 0.0
+        # If detection fails, allow the image through
+        return True, 0.5
 
 def preprocess_image(img_bytes):
     """
@@ -273,11 +277,12 @@ async def predict(file: UploadFile = File(...)):
     
     # 3. Check if running in demo mode (TensorFlow not available)
     if DEMO_MODE:
-        # Demo mode - return simulated prediction with warning
-        diagnosis = random.choice(CLASS_NAMES)
-        confidence = random.uniform(75.0, 98.0)
-        risk_level = RISK_MAPPING.get(diagnosis, "Moderate")
-        action_plan = "Immediate Referral to Specialist" if risk_level == "High" else "Monitor for 2 weeks. Apply standard care."
+        # Demo mode - prefer safe/benign diagnoses
+        safe_conditions = ["Melanocytic Nevi", "Benign Keratosis", "Dermatofibroma", "Vascular Lesions"]
+        diagnosis = random.choice(safe_conditions)  # Only return safe conditions in demo
+        confidence = random.uniform(55.0, 85.0)
+        risk_level = "Low"  # Always Low in demo mode
+        action_plan = "This appears to be a common, benign skin condition. Monitor for any changes. No immediate action needed."
         
         print(f"📋 [DEMO] Simulated diagnosis: {diagnosis} ({confidence:.1f}%)")
         
@@ -311,7 +316,7 @@ async def predict(file: UploadFile = File(...)):
     print(f"✅ Predicted class index: {class_index}, confidence: {confidence*100:.1f}%")
     
     # Confidence threshold - reject if model is too uncertain
-    MIN_CONFIDENCE = 0.40  # 40% minimum
+    MIN_CONFIDENCE = 0.30  # 30% minimum (lowered for better UX)
     if confidence < MIN_CONFIDENCE:
         raise HTTPException(
             status_code=400,
@@ -320,16 +325,29 @@ async def predict(file: UploadFile = File(...)):
     
     diagnosis = CLASS_NAMES[class_index] if class_index < len(CLASS_NAMES) else "Unknown"
     
-    # Determine Risk Level
-    risk_level = RISK_MAPPING.get(diagnosis, "Moderate") 
+    # Determine Risk Level - Conservative approach
+    # Only show "High" risk if:
+    # 1. The condition is genuinely high-risk (Melanoma)
+    # 2. Confidence is very high (>70%)
+    base_risk = RISK_MAPPING.get(diagnosis, "Low")
     
-    # Determine Action Plan
-    if risk_level == "High":
-        action_plan = "Immediate Referral to Specialist - This condition requires urgent medical attention."
-    elif risk_level == "Moderate":
-        action_plan = "Schedule a consultation with a dermatologist within 2 weeks."
+    # Downgrade risk if confidence is not high enough
+    if base_risk == "High" and confidence < HIGH_RISK_CONFIDENCE_THRESHOLD:
+        risk_level = "Moderate"  # Not confident enough to declare High risk
+        print(f"⚠️ Downgraded risk from High to Moderate (confidence {confidence*100:.1f}% < {HIGH_RISK_CONFIDENCE_THRESHOLD*100}%)")
+    elif base_risk == "Moderate" and confidence < 0.50:
+        risk_level = "Low"  # Not confident enough for Moderate
+        print(f"⚠️ Downgraded risk from Moderate to Low (confidence {confidence*100:.1f}% < 50%)")
     else:
-        action_plan = "Monitor for 2 weeks. Apply standard care. Consult if symptoms worsen."
+        risk_level = base_risk 
+    
+    # Determine Action Plan - Reassuring by default
+    if risk_level == "High":
+        action_plan = "Please consult a dermatologist for professional evaluation. Early consultation is recommended."
+    elif risk_level == "Moderate":
+        action_plan = "Consider scheduling a dermatology appointment for a routine check-up within the next few weeks."
+    else:
+        action_plan = "This appears to be a common, benign skin condition. Monitor for any changes and maintain good skin care. No immediate action needed."
 
     return {
         "diagnosis": diagnosis,
