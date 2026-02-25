@@ -1,0 +1,13 @@
+[tool.poetry]
+name = "dermasetu"
+version = "0.1.0"
+description = "DermaSetu backend for AI predictions"
+authors = ["you <you@example.com>"]
+
+[tool.poetry.dependencies]
+# Pin Python to 3.10.x so Render installs compatible TF wheels
+python = "^3.10"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
